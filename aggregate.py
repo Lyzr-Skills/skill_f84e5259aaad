@@ -523,7 +523,7 @@ def _load_table(file_path: str, data: str, data_format: str, dataset: str):
 # --------------------------------------------------------------------------- #
 # Metric parsing and aggregation
 # --------------------------------------------------------------------------- #
-def _parse_metrics(metrics: list, columns) -> list:
+def _parse_metrics(metrics: list, columns, group_by=(), use_source_names=False) -> list:
     if not metrics:
         raise AggregationError(
             "NoMetrics", "Provide at least one metric, e.g. 'sum:amount' or 'count:*'."
@@ -531,7 +531,8 @@ def _parse_metrics(metrics: list, columns) -> list:
 
     columns = list(columns)
     specs = []
-    used_aliases: set = set()
+    # Reserve the group-by names so a metric alias never collides with a group column.
+    used_aliases: set = set(group_by)
 
     for raw in metrics:
         parts = [part.strip() for part in str(raw).split(":")]
@@ -560,7 +561,15 @@ def _parse_metrics(metrics: list, columns) -> list:
                 f"Column '{column}' in metric '{raw}' not found. Available columns: {columns}.",
             )
 
-        alias = custom_alias or ("count" if is_count_star else f"{column}_{func_key}")
+        if custom_alias:
+            alias = custom_alias
+        elif is_count_star:
+            alias = "count"
+        elif use_source_names and column not in used_aliases:
+            # Emit the original column name as the header (canonical output), when free.
+            alias = column
+        else:
+            alias = f"{column}_{func_key}"
         base_alias = alias
         suffix = 2
         while alias in used_aliases:
@@ -706,19 +715,36 @@ def _json_safe(value):
     return value
 
 
-def _records_from_table(result: Table) -> list:
-    return [
-        {column: _json_safe(value) for column, value in zip(result.columns, row)}
+def _round_value(value, digits):
+    """Round a float to ``digits`` decimals; pass other values through unchanged."""
+    if digits is not None and digits >= 0 and isinstance(value, float):
+        return round(value, digits)
+    return value
+
+
+def _build_output(
+    table, source, group_by, metrics, result, output_format="records", round_digits=None
+) -> dict:
+    group_set = set(group_by)
+
+    def cell(column, value):
+        safe = _json_safe(value)
+        # Round metric values only; never touch the group-by key columns.
+        if column not in group_set:
+            safe = _round_value(safe, round_digits)
+        return safe
+
+    records = [
+        {column: cell(column, value) for column, value in zip(result.columns, row)}
         for row in result.rows
     ]
 
-
-def _build_output(table, source, group_by, metrics, result, output_format="records") -> dict:
-    records = _records_from_table(result)
-
     if output_format == "envelope":
         headers = list(result.columns)
-        rows = [[_json_safe(value) for value in row] for row in result.rows]
+        rows = [
+            [cell(column, value) for column, value in zip(result.columns, row)]
+            for row in result.rows
+        ]
         return {
             "name": source.get("dataset") or "aggregation_result",
             "headers": headers,
@@ -752,6 +778,8 @@ def aggregate_data(
     descending: bool = False,
     limit: int = 0,
     output_format: str = "records",
+    use_source_names: bool = False,
+    round_digits: int = -1,
 ) -> str:
     """Aggregate rows from a JSON/CSV file or inline data and return grouped results as JSON.
 
@@ -787,7 +815,14 @@ def aggregate_data(
         output_format: Output format for results. "records" (default) returns detailed
             results with records as objects. "envelope" returns a compact headers+rows
             format suitable for downstream pipeline chaining.
-
+        use_source_names: When True, each metric's output column is named after its
+            source column (e.g. "MedPaid" instead of "MedPaid_sum"), producing canonical
+            headers that match the input schema. Falls back to "column_func" if the same
+            source column is used by more than one metric (to keep names unambiguous).
+            Explicit ":alias" overrides and "count:*" are unaffected. Default False.
+        round_digits: When >= 0, round every floating-point metric value to this many
+            decimals (e.g. 2 for currency). Group-by key columns and integers are left
+            unchanged. -1 (default) disables rounding.
     Returns:
         A JSON string. On success:
         {"status": "success", "source": {...}, "rows_read": int, "columns": [...],
@@ -804,6 +839,9 @@ def aggregate_data(
         metrics = _normalize_str_list(metrics)
         descending = _to_bool(descending)
         limit = _to_int(limit)
+        use_source_names = _to_bool(use_source_names)
+        round_digits = _to_int(round_digits)
+        round_digits = round_digits if round_digits >= 0 else None
 
         loaded = _load_table(file_path, data, data_format, dataset)
 
@@ -813,10 +851,12 @@ def aggregate_data(
             for table, source in loaded:
                 if table.shape[1] == 0:
                     continue  # Skip empty datasets.
-                specs = _parse_metrics(metrics, table.columns)
+                specs = _parse_metrics(metrics, table.columns, group_by, use_source_names)
                 result = _run_aggregation(table, group_by, specs, sort_by, descending, limit)
                 dataset_results.append(
-                    _build_output(table, source, group_by, metrics, result, output_format)
+                    _build_output(
+                        table, source, group_by, metrics, result, output_format, round_digits
+                    )
                 )
             if output_format == "envelope":
                 return json.dumps({"datasets": dataset_results}, ensure_ascii=False)
@@ -829,9 +869,11 @@ def aggregate_data(
         if table.shape[1] == 0:
             raise AggregationError("EmptyData", "The input contains no columns.")
 
-        specs = _parse_metrics(metrics, table.columns)
+        specs = _parse_metrics(metrics, table.columns, group_by, use_source_names)
         result = _run_aggregation(table, group_by, specs, sort_by, descending, limit)
-        output = _build_output(table, source, group_by, metrics, result, output_format)
+        output = _build_output(
+            table, source, group_by, metrics, result, output_format, round_digits
+        )
 
         if output_format == "envelope":
             return json.dumps({"datasets": [output]}, ensure_ascii=False)
@@ -895,6 +937,20 @@ def _cli(argv=None) -> int:
         help='Output format: "records" (default) for detailed output, '
         '"envelope" for compact headers+rows format for pipeline chaining.',
     )
+    parser.add_argument(
+        "--source-names",
+        action="store_true",
+        help="Name each metric column after its source column (e.g. 'MedPaid' instead of "
+        "'MedPaid_sum') for canonical headers that match the input schema.",
+    )
+    parser.add_argument(
+        "--round",
+        type=int,
+        default=-1,
+        dest="round_digits",
+        help="Round floating-point metric values to this many decimals (e.g. 2). "
+        "-1 (default) disables rounding.",
+    )
     args = parser.parse_args(argv)
 
     result = aggregate_data(
@@ -908,6 +964,8 @@ def _cli(argv=None) -> int:
         descending=args.descending,
         limit=args.limit,
         output_format=args.output_format,
+        use_source_names=args.source_names,
+        round_digits=args.round_digits,
     )
     print(result)
     parsed = json.loads(result)

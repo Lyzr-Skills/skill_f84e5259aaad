@@ -40,6 +40,27 @@ and `--output-format envelope` — this rolls up every dataset at once and retur
 same `{"datasets": [{name, headers, rows, rowCount}]}` shape used downstream, so no
 manual reshaping or a second cleanup pass is needed.
 
+### Do NOT add `count:` per column
+
+Null vs. zero is **already handled**: a group whose values are all null/missing returns
+`null`, while a real `0` stays `0` (see "Null handling" below). Do **not** add a
+`count:<column>` metric next to each `sum:` just to detect empty groups — that doubles
+the metric list for nothing. Just pass the `sum:` (or other) metric you actually want.
+
+### Canonical output in one call (no reshape step)
+
+To get headers that match the **original column names** (e.g. `MedPaid`, not
+`MedPaid_sum`) and clean rounded numbers, add `--source-names` and `--round N`. This
+reproduces the canonical `{datasets:[{name, headers, rows, rowCount}]}` layout directly,
+so there is **no need to write a follow-up `reshape.py`**:
+
+```bash
+python /opt/skills/aggregate-json-only/aggregate.py --file-path agent_output.json \
+    --dataset all --group-by "IncurredMonth,PlanID" \
+    --metrics "sum:EmployeesCountEE,sum:Members,sum:MedPaid,sum:RxPaid,sum:DentalPaid,sum:Vision,sum:ClaimsOverISL" \
+    --source-names --round 2 --output-format envelope
+```
+
 ## When to use this skill
 
 Use it when the user asks for grouped summaries of JSON or CSV data, for example:
@@ -65,6 +86,12 @@ Command line (invoke the pre-installed file at its fixed path):
 python /opt/skills/aggregate-json-only/aggregate.py --file-path agent_output.json \
     --dataset all --group-by "IncurredMonth,PlanID" \
     --metrics "sum:MedPaid,sum:RxPaid,sum:Members" --output-format envelope
+
+# Canonical headers (original column names) + rounded numbers, in ONE call
+python /opt/skills/aggregate-json-only/aggregate.py --file-path agent_output.json \
+    --dataset all --group-by "IncurredMonth,PlanID" \
+    --metrics "sum:MedPaid,sum:RxPaid,sum:Members" \
+    --source-names --round 2 --output-format envelope
 
 # Group by one column, compute two metrics, sort and take the top rows
 python /opt/skills/aggregate-json-only/aggregate.py --file-path sales.csv --group-by region \
@@ -116,16 +143,21 @@ json_result = aggregate_data(
 | `descending`  | boolean         | No       | Sort descending when true. Default false. |
 | `limit`       | integer         | No       | Keep only the first N result rows. `0` (default) keeps all. |
 | `output_format` | string        | No       | `records` (default) for detailed per-row objects, or `envelope` for a compact `{name, headers, rows, rowCount}` shape suited to downstream pipeline chaining. |
+| `use_source_names` (`--source-names`) | boolean | No | Name each metric column after its source column (e.g. `MedPaid` instead of `MedPaid_sum`) for canonical headers matching the input schema. Falls back to `column_func` when a source column is used by more than one metric. Default false. |
+| `round_digits` (`--round`) | integer | No | Round floating-point metric values to this many decimals (e.g. `2`). Group-by keys and integers are untouched. `-1` (default) disables rounding. |
 
 **Supported metric functions:** `sum`, `mean`/`avg`, `min`, `max`, `count`,
 `nunique`/`distinct`, `median`, `std`, `var`, `first`, `last`.
 
 **Null handling for `sum`:** a group whose values are **all** null/missing sums to
 `null` (not `0`). Groups with at least one number sum normally. This preserves the
-distinction between "no data" and a real zero.
+distinction between "no data" and a real zero — so you never need a companion
+`count:<column>` metric to tell empty groups apart.
 
 **Metric alias rule:** each metric is named `{column}_{func}` (e.g. `amount_sum`), or
-`count` for `count:*`. Override with a third part, e.g. `sum:amount:total_sales`.
+`count` for `count:*`. Override with a third part, e.g. `sum:amount:total_sales`. With
+`--source-names`, an unambiguous metric is instead named after its source column
+(e.g. `amount`).
 
 ## JSON input shapes
 
@@ -180,14 +212,15 @@ With `--dataset all` (records format), results for every table are returned unde
 
 With `--output-format envelope`, results come back as a compact list of tables instead
 of verbose records — ideal for chaining into another step. Every run (single dataset or
-`--dataset all`) is wrapped in a `datasets` array:
+`--dataset all`) is wrapped in a `datasets` array. Adding `--source-names` makes the
+headers match the original column names (canonical output):
 
 ```json
 {
   "datasets": [
     {
       "name": "medical_claims",
-      "headers": ["IncurredMonth", "PlanID", "MedPaid_sum", "RxPaid_sum"],
+      "headers": ["IncurredMonth", "PlanID", "MedPaid", "RxPaid"],
       "rows": [
         ["2026-01-01", "1", 216209.75, 21395.27],
         ["2026-01-01", "2", 782565.27, 377350.32]
@@ -197,6 +230,8 @@ of verbose records — ideal for chaining into another step. Every run (single d
   ]
 }
 ```
+
+Without `--source-names`, the same headers would be `MedPaid_sum`, `RxPaid_sum`.
 
 On failure (JSON, never a stack trace):
 
